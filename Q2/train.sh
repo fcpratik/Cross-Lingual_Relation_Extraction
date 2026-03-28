@@ -1,0 +1,1 @@
+# This script should run the training and save checkpoints in the output/ dir

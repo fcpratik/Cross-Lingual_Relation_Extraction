@@ -1,0 +1,3 @@
+{"sentText": "Rosi Reddy with his wife , Rama Devi , of Hyderabad , India , and their granddaughter , Neha Vatti . ''", "articleId": "doc1", "relationMentions": [{"em1Text": "India", "em2Text": "Hyderabad", "label": "/location/location/contains"}], "entityMentions": [], "sentId": "1"}
+{"sentText": "Barack Obama was born in Honolulu, Hawaii.", "articleId": "doc2", "relationMentions": [{"em1Text": "Barack Obama", "em2Text": "Honolulu", "label": "/people/person/place_of_birth"}], "entityMentions": [], "sentId": "2"}
+{"sentText": "Apple is headquartered in Cupertino, California.", "articleId": "doc3", "relationMentions": [{"em1Text": "Apple", "em2Text": "Cupertino", "label": "/business/company/headquarters"}], "entityMentions": [], "sentId": "3"}

@@ -1,0 +1,3 @@
+{"entities": [{"em1": "India", "em2": "Hyderabad", "relation": "/location/location/contains"}]}
+{"entities": [{"em1": "Barack Obama", "em2": "Honolulu", "relation": "/people/person/place_lived"}]}
+Here is the JSON you requested: {"entities": []}
