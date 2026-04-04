@@ -3,28 +3,22 @@ Task 1: Relation Extraction with a Classification Head
 =======================================================
 - Base model: Qwen/Qwen2.5-1.5B (frozen)
 - LoRA adapters on attention layers
-- Classification head on pooled hidden states (entity boundary tokens)
-- Entity markers: [E1_START] entity1 [E1_END] ... [E2_START] entity2 [E2_END]
+- Classification head on pooled entity marker hidden states
+- Saves checkpoint after every epoch
+- Time-budgeted: targets < 150 min on V100
 
-Directory layout expected:
+Directory layout:
     Cross-Lingual_Relation_Extraction/
-    ├── en_sft_dataset/
-    │   ├── train.jsonl
-    │   └── valid.jsonl
-    ├── sft_dataset/
-    │   ├── hi_map.json, hi_train.jsonl
-    │   ├── kn_map.json, kn_train.jsonl
-    │   ├── or_map.json, or_train.jsonl
-    │   └── tcy_map.json, tcy_val.jsonl
-    └── Q1/
-        ├── train_classifier.py  (this file)
-        └── ...
+    ├── en_sft_dataset/train.jsonl, valid.jsonl
+    ├── sft_dataset/{hi,kn,or,tcy}_map.json, {hi,kn}_train.jsonl, ...
+    └── Q1/train_classifier.py
 """
 
 import os
 import sys
 import json
 import random
+import time
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,6 +27,7 @@ from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, TaskType
 from collections import Counter
+
 
 # ============================================================
 # 1. Configuration
@@ -47,16 +42,22 @@ class Config:
     lora_dropout = 0.1
     lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
-    # Training
-    batch_size = 8
-    gradient_accumulation_steps = 4
+    # Training — tuned for V100 time budget
+    batch_size = 16  # larger batch = fewer steps = faster
+    gradient_accumulation_steps = 2  # effective batch = 32
     learning_rate_lora = 2e-4
     learning_rate_head = 1e-3
-    num_epochs = 5
-    max_seq_len = 256
-    warmup_ratio = 0.1
+    num_epochs = 3  # 3 epochs is enough with 90k+ samples
+    max_seq_len = 200  # most NYT sentences fit in 200 tokens
+    warmup_ratio = 0.06
     weight_decay = 0.01
     max_grad_norm = 1.0
+
+    # Data budget — subsample English data if too large
+    max_en_samples = 60000  # cap English to control training time
+
+    # Time budget
+    max_train_minutes = 140  # hard stop at 140 min (buffer for save)
 
     seed = 42
 
@@ -74,52 +75,36 @@ def set_seed(seed):
 # ============================================================
 
 def load_label_maps(sft_dataset_dir):
-    """
-    Load all *_map.json files.
-    Returns:
-        indic_to_en: {indic_label -> english_label}
-        en_to_indic: {lang_code: {en_label -> indic_label}}
-    """
     indic_to_en = {}
     en_to_indic = {}
-
     if not os.path.isdir(sft_dataset_dir):
         return indic_to_en, en_to_indic
-
     for fname in os.listdir(sft_dataset_dir):
         if fname.endswith("_map.json"):
             lang_code = fname.replace("_map.json", "")
             fpath = os.path.join(sft_dataset_dir, fname)
             with open(fpath, "r", encoding="utf-8") as f:
-                mapping = json.load(f)  # {en_label: indic_label}
-
+                mapping = json.load(f)
             en_to_indic[lang_code] = mapping
             for en_label, indic_label in mapping.items():
                 indic_to_en[indic_label] = en_label
-
     return indic_to_en, en_to_indic
 
 
 def build_english_label_set(en_train_file, sft_dataset_dir):
-    """Build canonical English label ontology."""
     labels = set()
-
-    # From English training data
     if os.path.exists(en_train_file):
         for entry in load_jsonl(en_train_file):
             for rm in entry.get("relationMentions", []):
                 lbl = rm.get("label", "")
                 if lbl:
                     labels.add(lbl)
-
-    # From map files (English keys)
     if os.path.isdir(sft_dataset_dir):
         for fname in os.listdir(sft_dataset_dir):
             if fname.endswith("_map.json"):
                 with open(os.path.join(sft_dataset_dir, fname), "r", encoding="utf-8") as f:
                     mapping = json.load(f)
                 labels.update(mapping.keys())
-
     labels.discard("NA")
     labels.discard("")
     sorted_labels = ["NA"] + sorted(labels)
@@ -129,23 +114,20 @@ def build_english_label_set(en_train_file, sft_dataset_dir):
 
 
 # ============================================================
-# 3. Data Loading (handles both JSONL and pretty-printed JSON)
+# 3. Data Loading
 # ============================================================
 
 def load_jsonl(filepath):
-    """Load a JSONL file, handling both single-line and pretty-printed JSON."""
     entries = []
     if not os.path.exists(filepath):
-        print(f"  Warning: {filepath} not found, skipping.")
+        print(f"  Warning: {filepath} not found.")
         return entries
-
     with open(filepath, "r", encoding="utf-8") as f:
         content = f.read().strip()
-
     if not content:
         return entries
 
-    # Try standard JSONL first (one JSON object per line)
+    # Try standard JSONL
     try:
         for line in content.split("\n"):
             line = line.strip()
@@ -156,7 +138,7 @@ def load_jsonl(filepath):
     except json.JSONDecodeError:
         pass
 
-    # Fallback: pretty-printed JSON — accumulate braces
+    # Fallback: pretty-printed JSON
     entries = []
     buffer = ""
     brace_count = 0
@@ -168,23 +150,21 @@ def load_jsonl(filepath):
         brace_count += stripped.count("{") - stripped.count("}")
         if brace_count == 0 and buffer.strip():
             try:
-                entry = json.loads(buffer.strip())
-                entries.append(entry)
+                entries.append(json.loads(buffer.strip()))
             except json.JSONDecodeError:
                 pass
             buffer = ""
-
     print(f"  Loaded {len(entries)} entries from {filepath} (pretty-printed)")
     return entries
 
 
-def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en):
-    """Load all training samples, converting Indic labels to English."""
+def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en, max_en_samples):
     samples = []
 
     # --- English data ---
     print("Loading English data...")
     en_entries = load_jsonl(en_train_file)
+    en_samples = []
     for entry in en_entries:
         sent = entry.get("sentText", "")
         for rm in entry.get("relationMentions", []):
@@ -193,12 +173,37 @@ def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en):
             label = rm.get("label", "NA")
             if label not in label2id:
                 label = "NA"
-            samples.append({"sent": sent, "em1": em1, "em2": em2, "label": label})
+            en_samples.append({"sent": sent, "em1": em1, "em2": em2, "label": label})
 
+    # Subsample English if too large (stratified by label)
+    if len(en_samples) > max_en_samples:
+        print(f"  Subsampling English: {len(en_samples)} -> {max_en_samples}")
+        random.shuffle(en_samples)
+        # Keep balanced: ensure all labels represented
+        by_label = {}
+        for s in en_samples:
+            by_label.setdefault(s["label"], []).append(s)
+
+        per_label = max(10, max_en_samples // len(by_label))
+        subsampled = []
+        for lbl, items in by_label.items():
+            subsampled.extend(items[:per_label])
+
+        # Fill remaining quota randomly
+        remaining = max_en_samples - len(subsampled)
+        if remaining > 0:
+            used = set(id(s) for s in subsampled)
+            rest = [s for s in en_samples if id(s) not in used]
+            random.shuffle(rest)
+            subsampled.extend(rest[:remaining])
+
+        en_samples = subsampled[:max_en_samples]
+
+    samples.extend(en_samples)
     en_count = len(samples)
     print(f"  English samples: {en_count}")
 
-    # --- Indic language data (Task 1: hi, kn) ---
+    # --- Indic data (Task 1: hi, kn) ---
     indic_samples = []
     for lang in ["hi", "kn"]:
         candidates = [
@@ -211,9 +216,7 @@ def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en):
             if os.path.exists(c):
                 lang_file = c
                 break
-
         if lang_file is None:
-            print(f"  No training file found for {lang}, skipping.")
             continue
 
         print(f"Loading {lang} data from {lang_file}...")
@@ -224,17 +227,13 @@ def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en):
                 em1 = rm.get("em1Text", "")
                 em2 = rm.get("em2Text", "")
                 indic_label = rm.get("label", "NA")
-
-                # Convert Indic label -> English
                 en_label = indic_to_en.get(indic_label, indic_label)
                 if en_label not in label2id:
                     en_label = "NA"
-
                 indic_samples.append({"sent": sent, "em1": em1, "em2": em2, "label": en_label})
 
     print(f"  Indic samples (raw): {len(indic_samples)}")
 
-    # Oversample Indic data
     if indic_samples and en_count > 0:
         oversample_factor = max(1, en_count // (5 * max(len(indic_samples), 1)))
         oversample_factor = min(oversample_factor, 20)
@@ -244,6 +243,7 @@ def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en):
     else:
         samples.extend(indic_samples)
 
+    random.shuffle(samples)
     print(f"  Total training samples: {len(samples)}")
     return samples
 
@@ -253,7 +253,7 @@ def load_training_data(en_train_file, sft_dataset_dir, label2id, indic_to_en):
 # ============================================================
 
 class REDataset(Dataset):
-    def __init__(self, samples, tokenizer, label2id, max_seq_len=256):
+    def __init__(self, samples, tokenizer, label2id, max_seq_len=200):
         self.tokenizer = tokenizer
         self.label2id = label2id
         self.max_seq_len = max_seq_len
@@ -272,14 +272,12 @@ class REDataset(Dataset):
     def mark_entities(sent, em1, em2):
         entities = [(em1, "[E1_START]", "[E1_END]"), (em2, "[E2_START]", "[E2_END]")]
         entities.sort(key=lambda x: len(x[0]), reverse=True)
-
         marked = sent
         for ent_text, start_marker, end_marker in entities:
             if ent_text in marked:
                 marked = marked.replace(ent_text, f"{start_marker} {ent_text} {end_marker}", 1)
             else:
                 marked = f"{marked} {start_marker} {ent_text} {end_marker}"
-
         return marked
 
     def __getitem__(self, idx):
@@ -342,10 +340,8 @@ class REClassificationModel(nn.Module):
         hidden_states = outputs.hidden_states[-1]
         batch_size = hidden_states.size(0)
         batch_idx = torch.arange(batch_size, device=hidden_states.device)
-
         e1_hidden = hidden_states[batch_idx, e1_position]
         e2_hidden = hidden_states[batch_idx, e2_position]
-
         pooled = torch.cat([e1_hidden, e2_hidden], dim=-1)
         pooled = self.dropout(pooled)
         logits = self.classifier(pooled)
@@ -353,11 +349,55 @@ class REClassificationModel(nn.Module):
 
 
 # ============================================================
-# 6. Training Loop
+# 6. Save / Load Checkpoint
+# ============================================================
+
+def save_checkpoint(model, peft_model, tokenizer, label2id, id2label,
+                    en_to_indic, config, output_dir, epoch, is_best=False):
+    """Save a full checkpoint. Called after every epoch."""
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save LoRA adapter
+    peft_model.save_pretrained(os.path.join(output_dir, "lora_adapter"))
+
+    # Save tokenizer
+    tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
+
+    # Save classifier head
+    torch.save(model.classifier.state_dict(), os.path.join(output_dir, "classifier_head.pt"))
+
+    # Save label maps
+    with open(os.path.join(output_dir, "label2id.json"), "w", encoding="utf-8") as f:
+        json.dump(label2id, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_dir, "id2label.json"), "w", encoding="utf-8") as f:
+        json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(output_dir, "en_to_indic.json"), "w", encoding="utf-8") as f:
+        json.dump(en_to_indic, f, ensure_ascii=False, indent=2)
+
+    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({
+            "model_name": config.model_name,
+            "lora_r": config.lora_r,
+            "lora_alpha": config.lora_alpha,
+            "lora_dropout": config.lora_dropout,
+            "lora_target_modules": config.lora_target_modules,
+            "max_seq_len": config.max_seq_len,
+            "num_labels": len(label2id),
+            "hidden_size": peft_model.config.hidden_size,
+            "epoch": epoch,
+        }, f, indent=2)
+
+    tag = "best" if is_best else f"epoch_{epoch}"
+    print(f"  [Checkpoint saved: {tag} -> {output_dir}]")
+
+
+# ============================================================
+# 7. Training Loop
 # ============================================================
 
 def train(config, output_dir, root_dir):
     set_seed(config.seed)
+    train_start_time = time.time()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -368,9 +408,7 @@ def train(config, output_dir, root_dir):
 
     if not os.path.exists(en_train_file):
         print(f"ERROR: English training file not found at {en_train_file}")
-        print(f"  Root dir contents: {os.listdir(root_dir) if os.path.isdir(root_dir) else 'NOT FOUND'}")
         sys.exit(1)
-
     if not os.path.isdir(sft_dir):
         print(f"ERROR: sft_dataset dir not found at {sft_dir}")
         sys.exit(1)
@@ -379,12 +417,11 @@ def train(config, output_dir, root_dir):
     print(f"SFT dataset:   {sft_dir}")
     print(f"SFT contents:  {os.listdir(sft_dir)}")
 
-    # --- Load label maps ---
+    # --- Label maps ---
     print("\n--- Label Mappings ---")
     indic_to_en, en_to_indic = load_label_maps(sft_dir)
     print(f"Languages with maps: {list(en_to_indic.keys())}")
 
-    # --- Build label ontology ---
     print("\n--- Label Ontology ---")
     label2id, id2label = build_english_label_set(en_train_file, sft_dir)
     num_labels = len(label2id)
@@ -397,17 +434,16 @@ def train(config, output_dir, root_dir):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
-
     special_tokens = ["[E1_START]", "[E1_END]", "[E2_START]", "[E2_END]"]
     num_added = tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
     print(f"Added {num_added} special tokens")
 
     # --- Load data ---
     print("\n--- Loading Data ---")
-    samples = load_training_data(en_train_file, sft_dir, label2id, indic_to_en)
-
+    samples = load_training_data(en_train_file, sft_dir, label2id, indic_to_en,
+                                 config.max_en_samples)
     if len(samples) == 0:
-        print("ERROR: No training samples found!")
+        print("ERROR: No training samples!")
         sys.exit(1)
 
     dataset = REDataset(samples, tokenizer, label2id, config.max_seq_len)
@@ -421,16 +457,26 @@ def train(config, output_dir, root_dir):
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=2,
+        pin_memory=True if device.type == "cuda" else False,
         drop_last=False,
     )
+
+    # --- Time estimate ---
+    steps_per_epoch = len(dataloader)
+    total_opt_steps = (steps_per_epoch // config.gradient_accumulation_steps) * config.num_epochs
+    print(f"\n--- Time Estimate ---")
+    print(f"Samples: {len(dataset)}")
+    print(f"Batches/epoch: {steps_per_epoch}")
+    print(f"Total opt steps: {total_opt_steps}")
+    print(f"Time budget: {config.max_train_minutes} min")
 
     # --- Model ---
     print(f"\n--- Model ---")
     print(f"Loading {config.model_name}...")
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype=torch.float16 if device.type == "cuda" else torch.float32,
+        torch_dtype=torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32,
         device_map=None,
     )
     base_model.resize_token_embeddings(len(tokenizer))
@@ -455,10 +501,7 @@ def train(config, output_dir, root_dir):
         dropout=config.lora_dropout,
     )
     model = model.to(device)
-
-    if device.type == "cuda":
-        model.base_model.half()
-    model.classifier.float()
+    model.classifier.float()  # keep head in fp32
 
     # --- Optimizer ---
     optimizer_grouped_params = [
@@ -474,100 +517,100 @@ def train(config, output_dir, root_dir):
         },
     ]
     optimizer = torch.optim.AdamW(optimizer_grouped_params)
+    warmup_steps = int(total_opt_steps * config.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_opt_steps)
 
-    total_steps = (len(dataloader) // config.gradient_accumulation_steps) * config.num_epochs
-    warmup_steps = int(total_steps * config.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    # Use GradScaler for mixed precision if available
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
 
     # --- Training ---
-    print(f"\n--- Training ---")
-    print(f"Epochs: {config.num_epochs}")
-    print(f"Batches/epoch: {len(dataloader)}")
-    print(f"Effective batch: {config.batch_size * config.gradient_accumulation_steps}")
-    print(f"Total steps: {total_steps}")
+    print(f"\n{'=' * 50}")
+    print(f"TRAINING: {config.num_epochs} epochs, budget {config.max_train_minutes} min")
+    print(f"{'=' * 50}")
 
     model.train()
+    best_loss = float("inf")
 
     for epoch in range(config.num_epochs):
+        epoch_start = time.time()
         epoch_loss = 0
         num_batches = 0
         correct = 0
         total = 0
+        optimizer.zero_grad()
 
         for batch_idx, batch in enumerate(dataloader):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            e1_position = batch["e1_position"].to(device)
-            e2_position = batch["e2_position"].to(device)
-            labels = batch["label"].to(device)
+            # --- Time check ---
+            elapsed_min = (time.time() - train_start_time) / 60
+            if elapsed_min > config.max_train_minutes:
+                print(f"\n  TIME LIMIT REACHED ({elapsed_min:.1f} min). Stopping training.")
+                save_checkpoint(model, peft_model, tokenizer, label2id, id2label,
+                                en_to_indic, config, output_dir, epoch + 1, is_best=True)
+                print(f"Total training time: {elapsed_min:.1f} min")
+                return
 
-            if device.type == "cuda":
-                with torch.amp.autocast("cuda", dtype=torch.float16):
-                    logits = model(input_ids, attention_mask, e1_position, e2_position)
-                    logits = logits.float()
-                    loss = F.cross_entropy(logits, labels, weight=class_weight_tensor)
-                    loss = loss / config.gradient_accumulation_steps
-            else:
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            e1_position = batch["e1_position"].to(device, non_blocking=True)
+            e2_position = batch["e2_position"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 logits = model(input_ids, attention_mask, e1_position, e2_position)
-                loss = F.cross_entropy(logits, labels, weight=class_weight_tensor)
+                logits_fp32 = logits.float()
+                loss = F.cross_entropy(logits_fp32, labels, weight=class_weight_tensor)
                 loss = loss / config.gradient_accumulation_steps
 
-            loss.backward()
+            scaler.scale(loss).backward()
 
             if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
                 optimizer.zero_grad()
 
             epoch_loss += loss.item() * config.gradient_accumulation_steps
             num_batches += 1
-
-            preds = logits.argmax(dim=-1)
+            preds = logits_fp32.argmax(dim=-1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-            if (batch_idx + 1) % 200 == 0:
-                print(f"  Epoch {epoch+1} | Batch {batch_idx+1}/{len(dataloader)} | "
-                      f"Loss: {epoch_loss/num_batches:.4f} | Acc: {correct/total:.4f}")
+            # Progress every 500 batches
+            if (batch_idx + 1) % 500 == 0:
+                batch_elapsed = (time.time() - epoch_start) / 60
+                total_elapsed = (time.time() - train_start_time) / 60
+                eta_epoch = batch_elapsed / (batch_idx + 1) * steps_per_epoch
+                print(f"  Epoch {epoch + 1} | Batch {batch_idx + 1}/{steps_per_epoch} | "
+                      f"Loss: {epoch_loss / num_batches:.4f} | Acc: {correct / total:.4f} | "
+                      f"Time: {total_elapsed:.1f}m | ETA epoch: {eta_epoch:.1f}m")
 
+        # --- Epoch summary ---
         avg_loss = epoch_loss / max(num_batches, 1)
         accuracy = correct / max(total, 1)
-        print(f"Epoch {epoch+1}/{config.num_epochs} | Loss: {avg_loss:.4f} | Acc: {accuracy:.4f}")
+        epoch_time = (time.time() - epoch_start) / 60
+        total_time = (time.time() - train_start_time) / 60
 
-    # --- Save ---
-    print(f"\n--- Saving to {output_dir} ---")
-    os.makedirs(output_dir, exist_ok=True)
+        print(f"\nEpoch {epoch + 1}/{config.num_epochs} DONE | "
+              f"Loss: {avg_loss:.4f} | Acc: {accuracy:.4f} | "
+              f"Epoch time: {epoch_time:.1f}m | Total: {total_time:.1f}m")
 
-    peft_model.save_pretrained(os.path.join(output_dir, "lora_adapter"))
-    tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
-    torch.save(model.classifier.state_dict(), os.path.join(output_dir, "classifier_head.pt"))
+        # --- Save checkpoint after every epoch ---
+        is_best = avg_loss < best_loss
+        if is_best:
+            best_loss = avg_loss
+        save_checkpoint(model, peft_model, tokenizer, label2id, id2label,
+                        en_to_indic, config, output_dir, epoch + 1, is_best=is_best)
 
-    with open(os.path.join(output_dir, "label2id.json"), "w", encoding="utf-8") as f:
-        json.dump(label2id, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(output_dir, "id2label.json"), "w", encoding="utf-8") as f:
-        json.dump({str(k): v for k, v in id2label.items()}, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(output_dir, "en_to_indic.json"), "w", encoding="utf-8") as f:
-        json.dump(en_to_indic, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "model_name": config.model_name,
-            "lora_r": config.lora_r,
-            "lora_alpha": config.lora_alpha,
-            "lora_dropout": config.lora_dropout,
-            "lora_target_modules": config.lora_target_modules,
-            "max_seq_len": config.max_seq_len,
-            "num_labels": num_labels,
-            "hidden_size": hidden_size,
-        }, f, indent=2)
-
-    print("Done!")
+    total_time = (time.time() - train_start_time) / 60
+    print(f"\nTraining complete! Total time: {total_time:.1f} min")
 
 
 if __name__ == "__main__":
     output_dir = sys.argv[1] if len(sys.argv) > 1 else "output"
-    # root_dir = parent of Q1/, should contain en_sft_dataset/ and sft_dataset/
     root_dir = sys.argv[2] if len(sys.argv) > 2 else ".."
-
     config = Config()
     train(config, output_dir, root_dir)
