@@ -365,7 +365,7 @@ def train(config, output_dir, root_dir):
     print(f"Using device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
-        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     # --- Data paths ---
     en_sft_dir = os.path.join(root_dir, "en_sft_dataset")
@@ -465,7 +465,7 @@ def train(config, output_dir, root_dir):
 
     if device.type == "cuda":
         mem_alloc = torch.cuda.memory_allocated() / 1e9
-        mem_total = torch.cuda.get_device_properties(0).total_mem / 1e9
+        mem_total = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"GPU memory after model load: {mem_alloc:.1f} / {mem_total:.1f} GB")
 
     # --- Optimizer ---
