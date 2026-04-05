@@ -1,411 +1,182 @@
 """
-Task 2: Relation Extraction via Autoregressive Generation
-==========================================================
-- Base model: Qwen/Qwen2.5-1.5B with LoRA
-- Fine-tune to generate relation labels as text given sentence + entity pairs
-- Evaluated on: en, hi, kn, tcy, or
-- Trains on English data, adapts using Indic labeled data
+Task 2: Relation Extraction via Autoregressive Generation (Optimized)
+=====================================================================
+Key changes: max_en=15000, batch=8, grad_accum=4, max_seq_len=220
+Targets 3 full epochs in ~120 min on T4
 """
-
-import os
-import sys
-import json
-import random
-import time
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
-from peft import LoraConfig, get_peft_model, TaskType
-from collections import Counter
-
-# ============================================================
-# Config
-# ============================================================
+import os,sys,json,random,time
+import numpy as np,torch
+from torch.utils.data import Dataset,DataLoader
+from transformers import AutoTokenizer,AutoModelForCausalLM,get_linear_schedule_with_warmup
+from peft import LoraConfig,get_peft_model,TaskType
 
 class Config:
-    model_name = "Qwen/Qwen2.5-1.5B"
-    lora_r = 16
-    lora_alpha = 32
-    lora_dropout = 0.05
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
+    model_name="Qwen/Qwen2.5-1.5B"
+    lora_r=16; lora_alpha=32; lora_dropout=0.05
+    lora_target_modules=["q_proj","v_proj","k_proj","o_proj"]
+    batch_size=8; gradient_accumulation_steps=4
+    learning_rate=2e-4; num_epochs=3
+    max_input_len=180; max_output_len=40; max_seq_len=220
+    warmup_ratio=0.06; weight_decay=0.01; max_grad_norm=1.0
+    max_en_samples=15000; max_train_minutes=150; seed=42
 
-    batch_size = 4
-    gradient_accumulation_steps = 8  # effective batch = 32
-    learning_rate = 2e-4
-    num_epochs = 3
-    max_input_len = 220
-    max_output_len = 40
-    max_seq_len = 260  # input + output
-    warmup_ratio = 0.06
-    weight_decay = 0.01
-    max_grad_norm = 1.0
+def set_seed(s):
+    random.seed(s);np.random.seed(s);torch.manual_seed(s)
+    if torch.cuda.is_available():torch.cuda.manual_seed_all(s)
 
-    max_en_samples = 60000
-    max_train_minutes = 150
-    seed = 42
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-# ============================================================
-# Data Loading
-# ============================================================
-
-def load_label_maps(sft_dir):
-    indic_to_en = {}
-    en_to_indic = {}
-    if not os.path.isdir(sft_dir):
-        return indic_to_en, en_to_indic
-    for fname in os.listdir(sft_dir):
-        if fname.endswith("_map.json"):
-            lang = fname.replace("_map.json", "")
-            with open(os.path.join(sft_dir, fname), "r", encoding="utf-8") as f:
-                mapping = json.load(f)
-            en_to_indic[lang] = mapping
-            for en_l, indic_l in mapping.items():
-                indic_to_en[indic_l] = en_l
-    return indic_to_en, en_to_indic
-
-
-def load_jsonl(filepath):
-    entries = []
-    if not os.path.exists(filepath):
-        return entries
-    with open(filepath, "r", encoding="utf-8") as f:
-        content = f.read().strip()
-    if not content:
-        return entries
-    try:
-        for line in content.split("\n"):
-            line = line.strip()
-            if line:
-                entries.append(json.loads(line))
-        return entries
-    except json.JSONDecodeError:
-        pass
-    buffer = ""
-    brace_count = 0
+def load_jsonl(fp):
+    if not os.path.exists(fp): return []
+    with open(fp,"r",encoding="utf-8") as f: content=f.read().strip()
+    if not content: return []
+    try: return [json.loads(l) for l in content.split("\n") if l.strip()]
+    except json.JSONDecodeError: pass
+    entries,buf,bc=[],""  ,0
     for line in content.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        buffer += stripped + " "
-        brace_count += stripped.count("{") - stripped.count("}")
-        if brace_count == 0 and buffer.strip():
-            try:
-                entries.append(json.loads(buffer.strip()))
-            except json.JSONDecodeError:
-                pass
-            buffer = ""
+        s=line.strip()
+        if not s: continue
+        buf+=s+" "; bc+=s.count("{")-s.count("}")
+        if bc==0 and buf.strip():
+            try: entries.append(json.loads(buf.strip()))
+            except: pass
+            buf=""
     return entries
 
+def load_label_maps(sft_dir):
+    i2e,e2i={},{}
+    if not os.path.isdir(sft_dir): return i2e,e2i
+    for f in os.listdir(sft_dir):
+        if f.endswith("_map.json"):
+            lang=f.replace("_map.json","")
+            with open(os.path.join(sft_dir,f),"r",encoding="utf-8") as fh: m=json.load(fh)
+            e2i[lang]=m
+            for ek,iv in m.items(): i2e[iv]=ek
+    return i2e,e2i
 
-def build_label_set(en_train_file, sft_dir):
-    labels = set()
-    if os.path.exists(en_train_file):
-        for entry in load_jsonl(en_train_file):
-            for rm in entry.get("relationMentions", []):
-                lbl = rm.get("label", "")
-                if lbl:
-                    labels.add(lbl)
+def build_valid_labels(en_file,sft_dir):
+    labels=set()
+    for e in load_jsonl(en_file):
+        for rm in e.get("relationMentions",[]):
+            l=rm.get("label","")
+            if l: labels.add(l)
     if os.path.isdir(sft_dir):
-        for fname in os.listdir(sft_dir):
-            if fname.endswith("_map.json"):
-                with open(os.path.join(sft_dir, fname), "r", encoding="utf-8") as f:
-                    labels.update(json.load(f).keys())
+        for f in os.listdir(sft_dir):
+            if f.endswith("_map.json"):
+                with open(os.path.join(sft_dir,f),"r",encoding="utf-8") as fh: labels.update(json.load(fh).keys())
     labels.discard("")
     return sorted(labels)
 
+def fmt_in(s,e1,e2):
+    return f"Extract the relation between entities.\nSentence: {s}\nEntity 1: {e1}\nEntity 2: {e2}\nRelation:"
 
-def format_input(sent, em1, em2):
-    """Format input prompt for the model."""
-    return (
-        f"Extract the relation between the two entities in the sentence.\n"
-        f"Sentence: {sent}\n"
-        f"Entity 1: {em1}\n"
-        f"Entity 2: {em2}\n"
-        f"Relation:"
-    )
+def fmt_out(l): return f" {l}"
 
+def load_samples(en_file,sft_dir,i2e,max_en):
+    samples=[]
+    en=[]
+    for e in load_jsonl(en_file):
+        s=e.get("sentText","")
+        for rm in e.get("relationMentions",[]):
+            en.append((fmt_in(s,rm.get("em1Text",""),rm.get("em2Text","")),fmt_out(rm.get("label","NA"))))
+    if len(en)>max_en: random.shuffle(en); en=en[:max_en]
+    samples.extend(en); print(f"  English: {len(en)}")
 
-def format_output(label):
-    """Format expected output."""
-    return f" {label}"
-
-
-def load_training_samples(en_train_file, sft_dir, indic_to_en, max_en):
-    samples = []  # list of (input_text, output_text)
-
-    # English
-    print("Loading English data...")
-    en_entries = load_jsonl(en_train_file)
-    en_samples = []
-    for entry in en_entries:
-        sent = entry.get("sentText", "")
-        for rm in entry.get("relationMentions", []):
-            em1 = rm.get("em1Text", "")
-            em2 = rm.get("em2Text", "")
-            label = rm.get("label", "NA")
-            inp = format_input(sent, em1, em2)
-            out = format_output(label)
-            en_samples.append((inp, out))
-
-    if len(en_samples) > max_en:
-        random.shuffle(en_samples)
-        en_samples = en_samples[:max_en]
-    samples.extend(en_samples)
-    print(f"  English: {len(en_samples)}")
-
-    # Indic languages (all available for Task 2)
-    indic_samples = []
-    for lang in ["hi", "kn", "or", "tcy"]:
-        candidates = [
-            os.path.join(sft_dir, f"{lang}_train.jsonl"),
-            os.path.join(sft_dir, f"{lang}_val.jsonl"),
-        ]
-        lang_file = None
-        for c in candidates:
-            if os.path.exists(c):
-                lang_file = c
+    indic=[]
+    for lang in ["hi","kn","or","tcy"]:
+        for c in [f"{lang}_train.jsonl",f"{lang}_val.jsonl"]:
+            fp=os.path.join(sft_dir,c)
+            if os.path.exists(fp):
+                for e in load_jsonl(fp):
+                    s=e.get("sentText","")
+                    for rm in e.get("relationMentions",[]):
+                        il=rm.get("label","NA"); el=i2e.get(il,il)
+                        indic.append((fmt_in(s,rm.get("em1Text",""),rm.get("em2Text","")),fmt_out(el)))
                 break
-        if not lang_file:
-            continue
-        print(f"Loading {lang} from {lang_file}...")
-        for entry in load_jsonl(lang_file):
-            sent = entry.get("sentText", "")
-            for rm in entry.get("relationMentions", []):
-                em1 = rm.get("em1Text", "")
-                em2 = rm.get("em2Text", "")
-                indic_label = rm.get("label", "NA")
-                # Convert to English label for training
-                en_label = indic_to_en.get(indic_label, indic_label)
-                inp = format_input(sent, em1, em2)
-                out = format_output(en_label)
-                indic_samples.append((inp, out))
-
-    print(f"  Indic (raw): {len(indic_samples)}")
-    if indic_samples and len(en_samples) > 0:
-        factor = min(20, max(1, len(en_samples) // (5 * max(len(indic_samples), 1))))
-        indic_samples = indic_samples * factor
-        print(f"  Indic oversampled {factor}x: {len(indic_samples)}")
-    samples.extend(indic_samples)
-
-    random.shuffle(samples)
+    if indic and len(en)>0:
+        factor=min(15,max(1,len(en)//(5*max(len(indic),1))))
+        indic=indic*factor; print(f"  Indic {factor}x: {len(indic)}")
+    samples.extend(indic); random.shuffle(samples)
     print(f"  Total: {len(samples)}")
     return samples
 
+class GenDS(Dataset):
+    def __init__(self,samples,tok,max_in,max_seq):
+        self.samples=samples;self.tok=tok;self.max_in=max_in;self.max_seq=max_seq
+    def __len__(self): return len(self.samples)
+    def __getitem__(self,i):
+        inp,out=self.samples[i]
+        ie=self.tok(inp,max_length=self.max_in,truncation=True,add_special_tokens=False)
+        fe=self.tok(inp+out,max_length=self.max_seq,truncation=True,padding="max_length",add_special_tokens=False)
+        ids=torch.tensor(fe["input_ids"]); mask=torch.tensor(fe["attention_mask"])
+        labels=ids.clone(); labels[:len(ie["input_ids"])]=-100; labels[mask==0]=-100
+        return {"input_ids":ids,"attention_mask":mask,"labels":labels}
 
-# ============================================================
-# Dataset
-# ============================================================
+def save(model,tok,e2i,vlabels,cfg,odir,ep):
+    os.makedirs(odir,exist_ok=True)
+    model.save_pretrained(os.path.join(odir,"lora_adapter"))
+    tok.save_pretrained(os.path.join(odir,"tokenizer"))
+    for n,d in [("en_to_indic.json",e2i),("valid_labels.json",vlabels)]:
+        with open(os.path.join(odir,n),"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False)
+    with open(os.path.join(odir,"config.json"),"w") as f:
+        json.dump({"model_name":cfg.model_name,"max_input_len":cfg.max_input_len,
+                    "max_output_len":cfg.max_output_len,"max_seq_len":cfg.max_seq_len,"epoch":ep},f,indent=2)
+    print(f"  [Saved epoch {ep}]")
 
-class GenerativeREDataset(Dataset):
-    def __init__(self, samples, tokenizer, max_input_len, max_seq_len):
-        self.samples = samples
-        self.tokenizer = tokenizer
-        self.max_input_len = max_input_len
-        self.max_seq_len = max_seq_len
+def train(cfg,odir,root):
+    set_seed(cfg.seed); t0=time.time()
+    dev=torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {dev}")
+    en_file=os.path.join(root,"en_sft_dataset","train.jsonl")
+    sft_dir=os.path.join(root,"sft_dataset")
+    i2e,e2i=load_label_maps(sft_dir)
+    vlabels=build_valid_labels(en_file,sft_dir)
+    print(f"Labels: {len(vlabels)}")
 
-    def __len__(self):
-        return len(self.samples)
+    tok=AutoTokenizer.from_pretrained(cfg.model_name)
+    if tok.pad_token is None: tok.pad_token=tok.eos_token; tok.pad_token_id=tok.eos_token_id
 
-    def __getitem__(self, idx):
-        inp_text, out_text = self.samples[idx]
-        full_text = inp_text + out_text
+    samples=load_samples(en_file,sft_dir,i2e,cfg.max_en_samples)
+    ds=GenDS(samples,tok,cfg.max_input_len,cfg.max_seq_len)
+    dl=DataLoader(ds,batch_size=cfg.batch_size,shuffle=True,num_workers=2,pin_memory=True)
+    spe=len(dl); tot_steps=(spe//cfg.gradient_accumulation_steps)*cfg.num_epochs
+    print(f"Batches/epoch: {spe} | Steps: {tot_steps}")
 
-        # Tokenize input (for masking) and full sequence
-        input_enc = self.tokenizer(
-            inp_text, max_length=self.max_input_len,
-            truncation=True, add_special_tokens=False,
-        )
-        full_enc = self.tokenizer(
-            full_text, max_length=self.max_seq_len,
-            truncation=True, padding="max_length", add_special_tokens=False,
-        )
+    dt=torch.bfloat16 if dev.type=="cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    base=AutoModelForCausalLM.from_pretrained(cfg.model_name,torch_dtype=dt)
+    lora=LoraConfig(task_type=TaskType.CAUSAL_LM,r=cfg.lora_r,lora_alpha=cfg.lora_alpha,
+                     lora_dropout=cfg.lora_dropout,target_modules=cfg.lora_target_modules,bias="none")
+    model=get_peft_model(base,lora); model.gradient_checkpointing_enable()
+    model.print_trainable_parameters(); model.to(dev)
 
-        input_ids = torch.tensor(full_enc["input_ids"], dtype=torch.long)
-        attention_mask = torch.tensor(full_enc["attention_mask"], dtype=torch.long)
+    opt=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=cfg.learning_rate,weight_decay=cfg.weight_decay)
+    sched=get_linear_schedule_with_warmup(opt,int(tot_steps*cfg.warmup_ratio),tot_steps)
+    amp_on=dev.type=="cuda"; amp_dt=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler=torch.amp.GradScaler('cuda',enabled=(amp_on and amp_dt==torch.float16))
 
-        # Labels: mask input tokens with -100 (only train on output)
-        labels = input_ids.clone()
-        input_len = len(input_enc["input_ids"])
-        labels[:input_len] = -100
-        # Also mask padding
-        labels[attention_mask == 0] = -100
-
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-
-
-# ============================================================
-# Training
-# ============================================================
-
-def save_checkpoint(model, tokenizer, en_to_indic, valid_labels, config, output_dir, epoch):
-    os.makedirs(output_dir, exist_ok=True)
-    model.save_pretrained(os.path.join(output_dir, "lora_adapter"))
-    tokenizer.save_pretrained(os.path.join(output_dir, "tokenizer"))
-    with open(os.path.join(output_dir, "en_to_indic.json"), "w", encoding="utf-8") as f:
-        json.dump(en_to_indic, f, ensure_ascii=False, indent=2)
-    with open(os.path.join(output_dir, "valid_labels.json"), "w", encoding="utf-8") as f:
-        json.dump(valid_labels, f, ensure_ascii=False)
-    with open(os.path.join(output_dir, "config.json"), "w", encoding="utf-8") as f:
-        json.dump({
-            "model_name": config.model_name,
-            "max_input_len": config.max_input_len,
-            "max_output_len": config.max_output_len,
-            "max_seq_len": config.max_seq_len,
-            "epoch": epoch,
-        }, f, indent=2)
-    print(f"  [Checkpoint saved: epoch {epoch}]")
-
-
-def train(config, output_dir, root_dir):
-    set_seed(config.seed)
-    train_start = time.time()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
-    if device.type == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name(0)}")
-
-    en_sft_dir = os.path.join(root_dir, "en_sft_dataset")
-    sft_dir = os.path.join(root_dir, "sft_dataset")
-    en_train_file = os.path.join(en_sft_dir, "train.jsonl")
-
-    if not os.path.exists(en_train_file):
-        print(f"ERROR: {en_train_file} not found"); sys.exit(1)
-
-    # Labels
-    indic_to_en, en_to_indic = load_label_maps(sft_dir)
-    valid_labels = build_label_set(en_train_file, sft_dir)
-    print(f"Valid labels ({len(valid_labels)}): {valid_labels}")
-
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # Data
-    samples = load_training_samples(en_train_file, sft_dir, indic_to_en, config.max_en_samples)
-    dataset = GenerativeREDataset(samples, tokenizer, config.max_input_len, config.max_seq_len)
-    dataloader = DataLoader(
-        dataset, batch_size=config.batch_size, shuffle=True,
-        num_workers=2, pin_memory=(device.type == "cuda"),
-    )
-
-    steps_per_epoch = len(dataloader)
-    total_opt_steps = (steps_per_epoch // config.gradient_accumulation_steps) * config.num_epochs
-    print(f"Samples: {len(dataset)} | Batches/epoch: {steps_per_epoch} | Opt steps: {total_opt_steps}")
-
-    # Model
-    print(f"Loading {config.model_name}...")
-    model_dtype = torch.bfloat16 if (device.type == "cuda" and torch.cuda.is_bf16_supported()) else torch.float32
-    base_model = AutoModelForCausalLM.from_pretrained(config.model_name, torch_dtype=model_dtype)
-
-    # LoRA
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        lora_dropout=config.lora_dropout,
-        target_modules=config.lora_target_modules,
-        bias="none",
-    )
-    model = get_peft_model(base_model, lora_config)
-    model.gradient_checkpointing_enable()
-    model.print_trainable_parameters()
-    model = model.to(device)
-
-    if device.type == "cuda":
-        mem = torch.cuda.memory_allocated() / 1e9
-        print(f"GPU memory: {mem:.1f} GB")
-
-    # Optimizer
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=config.learning_rate, weight_decay=config.weight_decay,
-    )
-    warmup = int(total_opt_steps * config.warmup_ratio)
-    scheduler = get_linear_schedule_with_warmup(optimizer, warmup, total_opt_steps)
-
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
-
-    # Train
-    print(f"\n{'='*50}")
-    print(f"TRAINING: {config.num_epochs} epochs, budget {config.max_train_minutes}m")
-    print(f"{'='*50}")
-
+    print(f"\n{'='*50}\nTRAINING: {cfg.num_epochs} epochs\n{'='*50}")
     model.train()
-    for epoch in range(config.num_epochs):
-        epoch_start = time.time()
-        epoch_loss = 0
-        num_batches = 0
-        optimizer.zero_grad()
-
-        for batch_idx, batch in enumerate(dataloader):
-            elapsed = (time.time() - train_start) / 60
-            if elapsed > config.max_train_minutes:
-                print(f"\n  TIME LIMIT ({elapsed:.1f}m). Saving.")
-                save_checkpoint(model, tokenizer, en_to_indic, valid_labels, config, output_dir, epoch + 1)
-                return
-
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-
-            if use_amp:
-                with torch.amp.autocast('cuda', dtype=amp_dtype):
-                    outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                    loss = outputs.loss / config.gradient_accumulation_steps
-            else:
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-                loss = outputs.loss / config.gradient_accumulation_steps
-
+    for ep in range(cfg.num_epochs):
+        ep0=time.time(); eloss=0; nb=0; opt.zero_grad()
+        for bi,batch in enumerate(dl):
+            if (time.time()-t0)/60>cfg.max_train_minutes:
+                print(f"\n  TIME LIMIT"); save(model,tok,e2i,vlabels,cfg,odir,ep+1); return
+            ids=batch["input_ids"].to(dev,non_blocking=True)
+            mask=batch["attention_mask"].to(dev,non_blocking=True)
+            lab=batch["labels"].to(dev,non_blocking=True)
+            if amp_on:
+                with torch.amp.autocast('cuda',dtype=amp_dt):
+                    loss=model(input_ids=ids,attention_mask=mask,labels=lab).loss/cfg.gradient_accumulation_steps
+            else: loss=model(input_ids=ids,attention_mask=mask,labels=lab).loss/cfg.gradient_accumulation_steps
             scaler.scale(loss).backward()
+            if (bi+1)%cfg.gradient_accumulation_steps==0:
+                scaler.unscale_(opt); torch.nn.utils.clip_grad_norm_(model.parameters(),cfg.max_grad_norm)
+                scaler.step(opt); scaler.update(); sched.step(); opt.zero_grad()
+            eloss+=loss.item()*cfg.gradient_accumulation_steps; nb+=1
+            if (bi+1)%300==0:
+                print(f"  E{ep+1}|B{bi+1}/{spe}|L:{eloss/nb:.4f}|T:{(time.time()-t0)/60:.1f}m")
+        print(f"Epoch {ep+1}|L:{eloss/nb:.4f}|T:{(time.time()-ep0)/60:.1f}m|Tot:{(time.time()-t0)/60:.1f}m")
+        save(model,tok,e2i,vlabels,cfg,odir,ep+1)
+        if dev.type=="cuda": torch.cuda.empty_cache()
+    print(f"Done! {(time.time()-t0)/60:.1f}m")
 
-            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad()
-
-            epoch_loss += loss.item() * config.gradient_accumulation_steps
-            num_batches += 1
-
-            if (batch_idx + 1) % 500 == 0:
-                total_elapsed = (time.time() - train_start) / 60
-                print(f"  E{epoch+1} | B {batch_idx+1}/{steps_per_epoch} | "
-                      f"Loss: {epoch_loss/num_batches:.4f} | Time: {total_elapsed:.1f}m")
-
-        avg_loss = epoch_loss / max(num_batches, 1)
-        epoch_time = (time.time() - epoch_start) / 60
-        total_time = (time.time() - train_start) / 60
-        print(f"Epoch {epoch+1}/{config.num_epochs} | Loss: {avg_loss:.4f} | "
-              f"Epoch: {epoch_time:.1f}m | Total: {total_time:.1f}m")
-
-        save_checkpoint(model, tokenizer, en_to_indic, valid_labels, config, output_dir, epoch + 1)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
-
-    print(f"\nDone! Total: {(time.time() - train_start) / 60:.1f}m")
-
-
-if __name__ == "__main__":
-    output_dir = sys.argv[1] if len(sys.argv) > 1 else "output"
-    root_dir = sys.argv[2] if len(sys.argv) > 2 else ".."
-    train(Config(), output_dir, root_dir)
+if __name__=="__main__":
+    train(Config(),sys.argv[1] if len(sys.argv)>1 else "output",sys.argv[2] if len(sys.argv)>2 else "..")

@@ -1,227 +1,128 @@
-"""
-Task 1: Inference — Relation Extraction with Classification Head
-================================================================
-Uses AutoModel (no lm_head) — matches training script.
-Batched inference for speed.
-"""
-
-import os
-import sys
-import json
-import time
-import torch
-import torch.nn as nn
+"""Task 1: Inference with Classification Head"""
+import os, sys, json, time, torch, torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 from peft import PeftModel
 
 
-class REClassificationModel(nn.Module):
-    def __init__(self, base_model, hidden_size, num_labels, dropout=0.0):
-        super().__init__()
-        self.base_model = base_model
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, num_labels),
-        )
+class REModel(nn.Module):
+    def __init__(self, base, hs, nl):
+        super().__init__();
+        self.base = base
+        self.clf = nn.Sequential(nn.Linear(hs * 2, hs), nn.GELU(), nn.Dropout(0), nn.Linear(hs, nl))
 
-    def forward(self, input_ids, attention_mask, e1_position, e2_position):
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_states = outputs.last_hidden_state
-        batch_size = hidden_states.size(0)
-        batch_idx = torch.arange(batch_size, device=hidden_states.device)
-        e1_hidden = hidden_states[batch_idx, e1_position]
-        e2_hidden = hidden_states[batch_idx, e2_position]
-        pooled = torch.cat([e1_hidden, e2_hidden], dim=-1)
-        pooled = self.dropout(pooled)
-        return self.classifier(pooled)
+    def forward(self, ids, mask, e1, e2):
+        h = self.base(input_ids=ids, attention_mask=mask).last_hidden_state
+        b = torch.arange(h.size(0), device=h.device)
+        return self.clf(torch.cat([h[b, e1], h[b, e2]], dim=-1))
 
 
-def mark_entities(sent, em1, em2):
-    entities = [(em1, "[E1_START]", "[E1_END]"), (em2, "[E2_START]", "[E2_END]")]
-    entities.sort(key=lambda x: len(x[0]), reverse=True)
-    marked = sent
-    for ent_text, start_marker, end_marker in entities:
-        if ent_text in marked:
-            marked = marked.replace(ent_text, f"{start_marker} {ent_text} {end_marker}", 1)
+def mark(sent, e1, e2):
+    ents = [(e1, "[E1S]", "[E1E]"), (e2, "[E2S]", "[E2E]")]
+    ents.sort(key=lambda x: len(x[0]), reverse=True)
+    m = sent
+    for et, sm, em in ents:
+        if et in m:
+            m = m.replace(et, f"{sm} {et} {em}", 1)
         else:
-            marked = f"{marked} {start_marker} {ent_text} {end_marker}"
-    return marked
+            m = f"{m} {sm} {et} {em}"
+    return m
 
 
-def load_jsonl(filepath):
-    entries = []
-    with open(filepath, "r", encoding="utf-8") as f:
+def load_jsonl(fp):
+    if not os.path.exists(fp): return []
+    with open(fp, "r", encoding="utf-8") as f:
         content = f.read().strip()
-    if not content:
-        return entries
+    if not content: return []
     try:
-        for line in content.split("\n"):
-            line = line.strip()
-            if line:
-                entries.append(json.loads(line))
-        return entries
+        return [json.loads(l) for l in content.split("\n") if l.strip()]
     except json.JSONDecodeError:
         pass
-    buffer = ""
-    brace_count = 0
+    entries, buf, bc = [], "", 0
     for line in content.split("\n"):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        buffer += stripped + " "
-        brace_count += stripped.count("{") - stripped.count("}")
-        if brace_count == 0 and buffer.strip():
+        s = line.strip()
+        if not s: continue
+        buf += s + " ";
+        bc += s.count("{") - s.count("}")
+        if bc == 0 and buf.strip():
             try:
-                entries.append(json.loads(buffer.strip()))
-            except json.JSONDecodeError:
+                entries.append(json.loads(buf.strip()))
+            except:
                 pass
-            buffer = ""
+            buf = ""
     return entries
 
 
-def infer(lang, test_file, output_dir):
-    start_time = time.time()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device} | Lang: {lang} | Test: {test_file} | Model: {output_dir}")
+def infer(lang, test_file, odir):
+    t0 = time.time();
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device:{dev}|Lang:{lang}|Test:{test_file}")
+    cfg = json.load(open(os.path.join(odir, "config.json")))
+    l2i = json.load(open(os.path.join(odir, "label2id.json"), encoding="utf-8"))
+    i2l = json.load(open(os.path.join(odir, "id2label.json"), encoding="utf-8"))
+    e2i = {}
+    p = os.path.join(odir, "en_to_indic.json")
+    if os.path.exists(p): e2i = json.load(open(p, encoding="utf-8"))
+    lmap = e2i.get(lang, {})
+    tok = AutoTokenizer.from_pretrained(os.path.join(odir, "tokenizer"))
+    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    e1id = tok.convert_tokens_to_ids("[E1S]");
+    e2id = tok.convert_tokens_to_ids("[E2S]")
+    dt = torch.bfloat16 if dev.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
+    base = AutoModel.from_pretrained(cfg["model_name"], torch_dtype=dt)
+    base.resize_token_embeddings(len(tok))
+    peft = PeftModel.from_pretrained(base, os.path.join(odir, "lora_adapter"))
+    model = REModel(peft, cfg["hidden_size"], cfg["num_labels"])
+    model.clf.load_state_dict(
+        torch.load(os.path.join(odir, "classifier_head.pt"), map_location="cpu", weights_only=True))
+    model.to(dev).eval()
+    print(f"Loaded in {(time.time() - t0) / 60:.1f}m")
 
-    # Load config & labels
-    with open(os.path.join(output_dir, "config.json"), "r") as f:
-        config = json.load(f)
-    with open(os.path.join(output_dir, "label2id.json"), "r", encoding="utf-8") as f:
-        label2id = json.load(f)
-    with open(os.path.join(output_dir, "id2label.json"), "r", encoding="utf-8") as f:
-        id2label = json.load(f)
+    data = load_jsonl(test_file);
+    print(f"Samples:{len(data)}")
+    items = []
+    for ei, e in enumerate(data):
+        s = e.get("sentText", "")
+        for ri, rm in enumerate(e.get("relationMentions", [])):
+            items.append((ei, ri, mark(s, rm.get("em1Text", ""), rm.get("em2Text", ""))))
 
-    en_to_indic = {}
-    path = os.path.join(output_dir, "en_to_indic.json")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            en_to_indic = json.load(f)
-    lang_map = en_to_indic.get(lang, {})
-
-    num_labels = config["num_labels"]
-    hidden_size = config["hidden_size"]
-    max_seq_len = config["max_seq_len"]
-    model_name = config["model_name"]
-
-    # Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(os.path.join(output_dir, "tokenizer"))
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    e1_start_id = tokenizer.convert_tokens_to_ids("[E1_START]")
-    e2_start_id = tokenizer.convert_tokens_to_ids("[E2_START]")
-
-    # Model — AutoModel (no lm_head)
-    print("Loading model...")
-    model_dtype = torch.float32
-    if device.type == "cuda":
-        model_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-
-    base_model = AutoModel.from_pretrained(model_name, torch_dtype=model_dtype)
-    base_model.resize_token_embeddings(len(tokenizer))
-    peft_model = PeftModel.from_pretrained(base_model, os.path.join(output_dir, "lora_adapter"))
-
-    model = REClassificationModel(
-        base_model=peft_model, hidden_size=hidden_size,
-        num_labels=num_labels, dropout=0.0,
-    )
-    model.classifier.load_state_dict(torch.load(
-        os.path.join(output_dir, "classifier_head.pt"),
-        map_location="cpu", weights_only=True,
-    ))
-    model = model.to(device)
-    model.eval()
-
-    load_time = (time.time() - start_time) / 60
-    print(f"Model loaded in {load_time:.1f}m")
-
-    # Test data
-    test_data = load_jsonl(test_file)
-    print(f"Test samples: {len(test_data)}")
-
-    # Flatten all relation mentions
-    all_items = []
-    for eidx, entry in enumerate(test_data):
-        sent = entry.get("sentText", "")
-        for ridx, rm in enumerate(entry.get("relationMentions", [])):
-            em1 = rm.get("em1Text", "")
-            em2 = rm.get("em2Text", "")
-            all_items.append((eidx, ridx, mark_entities(sent, em1, em2), em1, em2))
-
-    print(f"Total predictions: {len(all_items)}")
-
-    # Batched inference
-    BATCH = 32
-    predictions = {}
-    use_amp = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if (use_amp and torch.cuda.is_bf16_supported()) else torch.float16
-
-    for bs in range(0, len(all_items), BATCH):
-        batch = all_items[bs:bs + BATCH]
-        texts = [it[2] for it in batch]
-        enc = tokenizer(texts, max_length=max_seq_len, truncation=True,
-                        padding="max_length", return_tensors="pt")
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc["attention_mask"].to(device)
-
-        e1_pos, e2_pos = [], []
+    BS = 64;
+    preds = {};
+    amp = dev.type == "cuda"
+    amp_dt = torch.bfloat16 if (amp and torch.cuda.is_bf16_supported()) else torch.float16
+    for bs in range(0, len(items), BS):
+        batch = items[bs:bs + BS]
+        enc = tok([it[2] for it in batch], max_length=cfg["max_seq_len"], truncation=True, padding="max_length",
+                  return_tensors="pt")
+        ids = enc["input_ids"].to(dev);
+        mask = enc["attention_mask"].to(dev)
+        e1p, e2p = [], []
         for i in range(len(batch)):
-            ids = input_ids[i]
-            mask = attention_mask[i]
-            last = mask.sum().item() - 1
-            e1 = (ids == e1_start_id).nonzero(as_tuple=True)[0]
-            e2 = (ids == e2_start_id).nonzero(as_tuple=True)[0]
-            e1_pos.append(e1[0].item() if len(e1) > 0 else last)
-            e2_pos.append(e2[0].item() if len(e2) > 0 else last)
-
-        e1_t = torch.tensor(e1_pos, device=device)
-        e2_t = torch.tensor(e2_pos, device=device)
-
+            last = mask[i].sum().item() - 1
+            e1 = (ids[i] == e1id).nonzero(as_tuple=True)[0];
+            e2 = (ids[i] == e2id).nonzero(as_tuple=True)[0]
+            e1p.append(e1[0].item() if len(e1) > 0 else last);
+            e2p.append(e2[0].item() if len(e2) > 0 else last)
         with torch.no_grad():
-            if use_amp:
-                with torch.amp.autocast('cuda', dtype=amp_dtype):
-                    logits = model(input_ids, attention_mask, e1_t, e2_t)
+            if amp:
+                with torch.amp.autocast('cuda', dtype=amp_dt):
+                    logits = model(ids, mask, torch.tensor(e1p, device=dev), torch.tensor(e2p, device=dev))
             else:
-                logits = model(input_ids, attention_mask, e1_t, e2_t)
+                logits = model(ids, mask, torch.tensor(e1p, device=dev), torch.tensor(e2p, device=dev))
+        for i, it in enumerate(batch):
+            el = i2l[str(logits.argmax(-1)[i].item())]
+            preds[(it[0], it[1])] = lmap.get(el, el) if lang != "en" and lmap else el
 
-        preds = logits.argmax(dim=-1).cpu().tolist()
-        for i, item in enumerate(batch):
-            en_label = id2label[str(preds[i])]
-            pred_label = lang_map.get(en_label, en_label) if (lang != "en" and lang_map) else en_label
-            predictions[(item[0], item[1])] = pred_label
-
-        if ((bs // BATCH) + 1) % 5 == 0:
-            elapsed = (time.time() - start_time) / 60
-            print(f"  {bs + len(batch)}/{len(all_items)} | {elapsed:.1f}m")
-
-    # Write output
-    output_file = os.path.join(output_dir, f"output_{lang}.jsonl")
-    with open(output_file, "w", encoding="utf-8") as fout:
-        for eidx, entry in enumerate(test_data):
-            out = {
-                "articleId": entry.get("articleId", ""),
-                "sentId": entry.get("sentId", ""),
-                "sentText": entry.get("sentText", ""),
-                "relationMentions": [
-                    {"em1Text": rm.get("em1Text", ""),
-                     "em2Text": rm.get("em2Text", ""),
-                     "label": predictions.get((eidx, ridx), "NA")}
-                    for ridx, rm in enumerate(entry.get("relationMentions", []))
-                ],
-            }
-            fout.write(json.dumps(out, ensure_ascii=False) + "\n")
-
-    total = (time.time() - start_time) / 60
-    print(f"\nSaved: {output_file} | Time: {total:.1f}m")
+    of = os.path.join(odir, f"output_{lang}.jsonl")
+    with open(of, "w", encoding="utf-8") as f:
+        for ei, e in enumerate(data):
+            f.write(json.dumps(
+                {"articleId": e.get("articleId", ""), "sentId": e.get("sentId", ""), "sentText": e.get("sentText", ""),
+                 "relationMentions": [{"em1Text": rm.get("em1Text", ""), "em2Text": rm.get("em2Text", ""),
+                                       "label": preds.get((ei, ri), "NA")} for ri, rm in
+                                      enumerate(e.get("relationMentions", []))]}, ensure_ascii=False) + "\n")
+    print(f"Saved:{of}|{(time.time() - t0) / 60:.1f}m")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 4:
-        print("Usage: python infer_classifier.py <lang> <test_file> <output_dir>")
-        sys.exit(1)
+    if len(sys.argv) < 4: print("Usage: python infer_classifier.py <lang> <test_file> <output_dir>"); sys.exit(1)
     infer(sys.argv[1], sys.argv[2], sys.argv[3])
