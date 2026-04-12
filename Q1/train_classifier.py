@@ -22,23 +22,16 @@ from collections import Counter
 
 
 class Config:
-    model_name = "Qwen/Qwen2.5-1.5B"
-    lora_r = 16
-    lora_alpha = 32
-    lora_dropout = 0.1
-    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
-    batch_size = 32
-    gradient_accumulation_steps = 1
-    learning_rate_lora = 2e-4
-    learning_rate_head = 1e-3
-    num_epochs = 3
-    max_seq_len = 150
-    warmup_ratio = 0.06
-    weight_decay = 0.01
-    max_grad_norm = 1.0
-    max_en_samples = 15000
-    max_train_minutes = 140
-    seed = 42
+    model_name="Qwen/Qwen2.5-1.5B"
+    lora_r=16;lora_alpha=32;lora_dropout=0.1
+    lora_target_modules=["q_proj","v_proj","k_proj","o_proj"]
+    batch_size=16;gradient_accumulation_steps=2
+    learning_rate_lora=2e-4;learning_rate_head=1e-3
+    num_epochs=3;max_seq_len=150
+    warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
+    max_en_samples=8000          # Reduced from 15000 for full 3 epochs on T4
+    max_train_minutes=140
+    seed=42
 
 
 def set_seed(s):
