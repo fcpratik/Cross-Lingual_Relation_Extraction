@@ -1,11 +1,3 @@
 #!/bin/bash
-# Task 3: ICL Inference with Llama-3.1-8B-Instruct
-# Usage: ./infer.sh <lang_code> <test_file_path> <output_dir>
-LANG=${1:?"Usage: ./infer.sh <hi/kn/or/tcy> <test_file> <output_dir>"}
-TEST_FILE=${2:?"Provide test file path"}
-OUTPUT_DIR=${3:-"output"}
-echo "============================================"
-echo "Task 3: ICL Inference"
-echo "Language: $LANG | Test: $TEST_FILE"
-echo "============================================"
-python icl_inference.py "$LANG" "$TEST_FILE" "$OUTPUT_DIR"
+# Usage: ./infer.sh <lang> <test_file> <output_dir>
+python "$(dirname "$0")/icl_inference.py" "$1" "$2" "$3"
