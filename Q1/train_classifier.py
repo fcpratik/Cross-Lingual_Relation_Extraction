@@ -8,18 +8,18 @@ from collections import Counter
 
 class Config:
     model_name="Qwen/Qwen2.5-1.5B"
-    lora_r=16;lora_alpha=32;lora_dropout=0.1
-    lora_target_modules=["q_proj","v_proj","k_proj","o_proj"]
-    batch_size=16;gradient_accumulation_steps=2
+    lora_r=32;lora_alpha=64;lora_dropout=0.05
+    lora_target_modules=["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]
+    batch_size=64;gradient_accumulation_steps=1
     learning_rate_lora=2e-4;learning_rate_head=1e-3
-    num_epochs=3;max_seq_len=150
+    num_epochs=5;max_seq_len=200
     warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
-    max_en_samples=25000
-    max_train_minutes=140
+    max_en_samples=60000
+    max_train_minutes=135
     seed=42
     num_pool_layers=4
-    rare_oversample=2
-    rare_threshold=200
+    rare_oversample=4
+    rare_threshold=500
 
 def set_seed(s):
     random.seed(s);np.random.seed(s);torch.manual_seed(s)
@@ -94,7 +94,7 @@ def load_samples(en_file,sft_dir,label2id,i2e,max_en,rare_factor,rare_threshold)
     en=augmented
     samples.extend(en);print(f"  English: {len(en)}")
     indic=[]
-    for lang in ["hi","kn"]:
+    for lang in ["hi","kn","or","tcy"]:
         for c in [f"{lang}_train.jsonl",f"{lang}_val.jsonl"]:
             fp=os.path.join(sft_dir,c)
             if os.path.exists(fp):
@@ -106,7 +106,7 @@ def load_samples(en_file,sft_dir,label2id,i2e,max_en,rare_factor,rare_threshold)
                         indic.append({"sent":s,"em1":rm.get("em1Text",""),"em2":rm.get("em2Text",""),"label":el})
                 break
     if indic and len(en)>0:
-        factor=min(15,max(1,len(en)//(5*max(len(indic),1))))
+        factor=min(15,max(3,len(en)//(5*max(len(indic),1))))
         indic=indic*factor;print(f"  Indic {factor}x: {len(indic)}")
     samples.extend(indic);random.shuffle(samples);print(f"  Total: {len(samples)}")
     return samples

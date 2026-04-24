@@ -8,14 +8,14 @@ from peft import LoraConfig,get_peft_model,TaskType
 
 class Config:
     model_name="Qwen/Qwen2.5-1.5B"
-    lora_r=16;lora_alpha=32;lora_dropout=0.05
-    lora_target_modules=["q_proj","v_proj","k_proj","o_proj"]
-    batch_size=4;gradient_accumulation_steps=8
+    lora_r=32;lora_alpha=64;lora_dropout=0.05
+    lora_target_modules=["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]
+    batch_size=8;gradient_accumulation_steps=4
     learning_rate=2e-4;num_epochs=3
     max_input_len=180;max_output_len=40;max_seq_len=220
     warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
-    max_en_samples=15000
-    max_train_minutes=140
+    max_en_samples=40000
+    max_train_minutes=135
     seed=42
 
 def set_seed(s):
@@ -93,7 +93,7 @@ def load_samples(en_file,sft_dir,i2e,max_en):
                         indic.append((fmt_in(s,rm.get("em1Text",""),rm.get("em2Text","")),fmt_out(el)))
                 break
     if indic and len(en)>0:
-        factor=min(10,max(1,len(en)//(5*max(len(indic),1))))
+        factor=min(10,max(3,len(en)//(5*max(len(indic),1))))
         indic=indic*factor;print(f"  Indic {factor}x: {len(indic)}")
     samples.extend(indic);random.shuffle(samples);print(f"  Total: {len(samples)}")
     return samples
@@ -144,6 +144,7 @@ def train(cfg,odir,root):
     lora=LoraConfig(task_type=TaskType.CAUSAL_LM,r=cfg.lora_r,lora_alpha=cfg.lora_alpha,
                      lora_dropout=cfg.lora_dropout,target_modules=cfg.lora_target_modules,bias="none")
     model=get_peft_model(base,lora)
+    model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
     model.print_trainable_parameters();model.to(dev)
 
