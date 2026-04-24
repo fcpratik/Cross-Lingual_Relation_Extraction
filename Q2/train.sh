@@ -1,2 +1,7 @@
 #!/bin/bash
-python "$(dirname "$0")/train_generative.py" "${1:-output}" "${2:-..}"
+set -e
+OUTPUT_DIR="${1:-output}"
+mkdir -p "$OUTPUT_DIR"
+cd "$(dirname "$0")"
+export TOKENIZERS_PARALLELISM=false
+python train_generative.py "$OUTPUT_DIR" ..

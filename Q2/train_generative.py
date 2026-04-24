@@ -13,7 +13,7 @@ class Config:
     max_input_len=180;max_output_len=40;max_seq_len=220
     warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
     max_en_samples=25000
-    max_train_minutes=140
+    max_train_minutes=120
     seed=42
 
 def set_seed(s):
