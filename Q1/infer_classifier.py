@@ -1,4 +1,9 @@
-"""Task 1: Inference — outputs Q1_<lang>.jsonl"""
+"""Task 1: Inference — FIXED
+- Model loaded from odir (same dir where train.sh saved it)
+- Output: odir/Q1_{lang}.jsonl
+- Usage: python infer_classifier.py <lang> <test_file> <output_dir>
+  where output_dir contains the trained model AND receives the output
+"""
 import os,sys,json,time,torch,torch.nn as nn
 from transformers import AutoTokenizer,AutoModel
 from peft import PeftModel
@@ -28,9 +33,10 @@ def mark(sent,e1,e2):
     return m
 
 def read_jsonl(fp):
-    """TA-provided format reader."""
     data=[]
-    if not os.path.exists(fp):return data
+    if not os.path.exists(fp):
+        print(f"WARNING: File not found: {fp}")
+        return data
     with open(fp,'r',encoding='utf-8') as f:
         for line in f:
             line=line.strip()
@@ -38,9 +44,9 @@ def read_jsonl(fp):
                 try:data.append(json.loads(line))
                 except:pass
     if data:return data
-    # Fallback: pretty-printed JSON
     with open(fp,'r',encoding='utf-8') as f:content=f.read().strip()
-    buf,bc=""  ,0
+    if not content:return data
+    buf,bc="",0
     for line in content.split("\n"):
         s=line.strip()
         if not s:continue
@@ -54,30 +60,35 @@ def read_jsonl(fp):
 def infer(lang,test_file,odir):
     t0=time.time();dev=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device:{dev}|Lang:{lang}|Test:{test_file}")
-    model_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)),"output")
-    cfg=json.load(open(os.path.join(model_dir,"config.json")))
-    l2i=json.load(open(os.path.join(model_dir,"label2id.json"),encoding="utf-8"))
-    i2l=json.load(open(os.path.join(model_dir,"id2label.json"),encoding="utf-8"))
-    e2i={};p=os.path.join(model_dir,"en_to_indic.json")
+
+    # odir is BOTH where model lives AND where output goes
+    cfg=json.load(open(os.path.join(odir,"config.json")))
+    l2i=json.load(open(os.path.join(odir,"label2id.json"),encoding="utf-8"))
+    i2l=json.load(open(os.path.join(odir,"id2label.json"),encoding="utf-8"))
+    e2i={};p=os.path.join(odir,"en_to_indic.json")
     if os.path.exists(p):e2i=json.load(open(p,encoding="utf-8"))
     lmap=e2i.get(lang,{})
-    tok=AutoTokenizer.from_pretrained(os.path.join(model_dir,"tokenizer"))
+
+    tok=AutoTokenizer.from_pretrained(os.path.join(odir,"tokenizer"))
     if tok.pad_token is None:tok.pad_token=tok.eos_token
     e1id=tok.convert_tokens_to_ids("[E1S]");e2id=tok.convert_tokens_to_ids("[E2S]")
+
     dt=torch.bfloat16 if dev.type=="cuda" and torch.cuda.is_bf16_supported() else torch.float32
     base=AutoModel.from_pretrained(cfg["model_name"],torch_dtype=dt)
     base.resize_token_embeddings(len(tok))
-    peft=PeftModel.from_pretrained(base,os.path.join(model_dir,"lora_adapter"))
+    peft=PeftModel.from_pretrained(base,os.path.join(odir,"lora_adapter"))
     model=REModel(peft,cfg["hidden_size"],cfg["num_labels"],cfg.get("num_pool_layers",4))
-    model.clf.load_state_dict(torch.load(os.path.join(model_dir,"classifier_head.pt"),map_location="cpu",weights_only=True))
+    model.clf.load_state_dict(torch.load(os.path.join(odir,"classifier_head.pt"),map_location="cpu",weights_only=True))
     model.to(dev).eval()
     print(f"Loaded in {(time.time()-t0)/60:.1f}m")
+
     data=read_jsonl(test_file);print(f"Samples:{len(data)}")
     items=[]
     for ei,e in enumerate(data):
         s=e.get("sentText","")
         for ri,rm in enumerate(e.get("relationMentions",[])):
             items.append((ei,ri,mark(s,rm.get("em1Text",""),rm.get("em2Text",""))))
+
     BS=64;preds={};amp=dev.type=="cuda"
     amp_dt=torch.bfloat16 if(amp and torch.cuda.is_bf16_supported())else torch.float16
     for bs in range(0,len(items),BS):
@@ -96,8 +107,8 @@ def infer(lang,test_file,odir):
         for i,it in enumerate(batch):
             el=i2l[str(logits.argmax(-1)[i].item())]
             preds[(it[0],it[1])]=lmap.get(el,el) if lang!="en" and lmap else el
-    os.makedirs(odir,exist_ok=True)
-    # TA-required output name: Q1_<lang>.jsonl
+
+    # Output to odir with naming: Q1_{lang}.jsonl
     of=os.path.join(odir,f"Q1_{lang}.jsonl")
     with open(of,"w",encoding="utf-8") as f:
         for ei,e in enumerate(data):

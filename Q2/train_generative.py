@@ -1,4 +1,6 @@
-"""Task 2: RE via Autoregressive Generation"""
+"""Task 2: RE via Autoregressive Generation — FIXED
+Key fix: removed GradScaler (crashes on Python 3.13 + gradient checkpointing)
+"""
 import os,sys,json,random,time,numpy as np,torch
 from torch.utils.data import Dataset,DataLoader
 from transformers import AutoTokenizer,AutoModelForCausalLM,get_linear_schedule_with_warmup
@@ -12,30 +14,36 @@ class Config:
     learning_rate=2e-4;num_epochs=3
     max_input_len=180;max_output_len=40;max_seq_len=220
     warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
-    max_en_samples=25000
-    max_train_minutes=120
+    max_en_samples=15000
+    max_train_minutes=140
     seed=42
 
 def set_seed(s):
     random.seed(s);np.random.seed(s);torch.manual_seed(s)
     if torch.cuda.is_available():torch.cuda.manual_seed_all(s)
 
-def load_jsonl(fp):
-    if not os.path.exists(fp):return[]
-    with open(fp,"r",encoding="utf-8") as f:content=f.read().strip()
-    if not content:return[]
-    try:return[json.loads(l) for l in content.split("\n") if l.strip()]
-    except json.JSONDecodeError:pass
-    entries,buf,bc=[],"",0
+def read_jsonl(fp):
+    data=[]
+    if not os.path.exists(fp):return data
+    with open(fp,'r',encoding='utf-8') as f:
+        for line in f:
+            line=line.strip()
+            if line:
+                try:data.append(json.loads(line))
+                except:pass
+    if data:return data
+    with open(fp,'r',encoding='utf-8') as f:content=f.read().strip()
+    if not content:return data
+    buf,bc="",0
     for line in content.split("\n"):
         s=line.strip()
         if not s:continue
         buf+=s+" ";bc+=s.count("{")-s.count("}")
         if bc==0 and buf.strip():
-            try:entries.append(json.loads(buf.strip()))
+            try:data.append(json.loads(buf.strip()))
             except:pass
             buf=""
-    return entries
+    return data
 
 def load_label_maps(sft_dir):
     i2e,e2i={},{}
@@ -50,7 +58,7 @@ def load_label_maps(sft_dir):
 
 def build_valid_labels(en_file,sft_dir):
     labels=set()
-    for e in load_jsonl(en_file):
+    for e in read_jsonl(en_file):
         for rm in e.get("relationMentions",[]):
             l=rm.get("label","")
             if l:labels.add(l)
@@ -67,7 +75,7 @@ def fmt_out(l):return f" {l}"
 
 def load_samples(en_file,sft_dir,i2e,max_en):
     samples=[];en=[]
-    for e in load_jsonl(en_file):
+    for e in read_jsonl(en_file):
         s=e.get("sentText","")
         for rm in e.get("relationMentions",[]):
             en.append((fmt_in(s,rm.get("em1Text",""),rm.get("em2Text","")),fmt_out(rm.get("label","NA"))))
@@ -78,7 +86,7 @@ def load_samples(en_file,sft_dir,i2e,max_en):
         for c in [f"{lang}_train.jsonl",f"{lang}_val.jsonl"]:
             fp=os.path.join(sft_dir,c)
             if os.path.exists(fp):
-                for e in load_jsonl(fp):
+                for e in read_jsonl(fp):
                     s=e.get("sentText","")
                     for rm in e.get("relationMentions",[]):
                         il=rm.get("label","NA");el=i2e.get(il,il)
@@ -128,16 +136,20 @@ def train(cfg,odir,root):
     dl=DataLoader(ds,batch_size=cfg.batch_size,shuffle=True,num_workers=2,pin_memory=True)
     spe=len(dl);tot_steps=(spe//cfg.gradient_accumulation_steps)*cfg.num_epochs
     print(f"Batches/epoch: {spe} | Steps: {tot_steps}")
-    dt=torch.bfloat16 if dev.type=="cuda" and torch.cuda.is_bf16_supported() else torch.float32
+
+    # Use bfloat16 natively — NO GradScaler (crashes on Python 3.13)
+    use_bf16 = dev.type=="cuda" and torch.cuda.is_bf16_supported()
+    dt = torch.bfloat16 if use_bf16 else torch.float32
     base=AutoModelForCausalLM.from_pretrained(cfg.model_name,torch_dtype=dt)
     lora=LoraConfig(task_type=TaskType.CAUSAL_LM,r=cfg.lora_r,lora_alpha=cfg.lora_alpha,
                      lora_dropout=cfg.lora_dropout,target_modules=cfg.lora_target_modules,bias="none")
-    model=get_peft_model(base,lora);model.gradient_checkpointing_enable()
+    model=get_peft_model(base,lora)
+    model.gradient_checkpointing_enable()
     model.print_trainable_parameters();model.to(dev)
+
     opt=torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],lr=cfg.learning_rate,weight_decay=cfg.weight_decay)
     sched=get_linear_schedule_with_warmup(opt,int(tot_steps*cfg.warmup_ratio),tot_steps)
-    amp_on=dev.type=="cuda";amp_dt=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    scaler=torch.amp.GradScaler('cuda',enabled=(amp_on and amp_dt==torch.float16))
+
     print(f"\n{'='*50}\nTRAINING: {cfg.num_epochs} epochs\n{'='*50}")
     model.train()
     for ep in range(cfg.num_epochs):
@@ -147,14 +159,15 @@ def train(cfg,odir,root):
                 print(f"\n  TIME LIMIT");save(model,tok,e2i,vlabels,cfg,odir,ep+1);return
             ids=batch["input_ids"].to(dev,non_blocking=True);mask=batch["attention_mask"].to(dev,non_blocking=True)
             lab=batch["labels"].to(dev,non_blocking=True)
-            if amp_on:
-                with torch.amp.autocast('cuda',dtype=amp_dt):
+            if use_bf16:
+                with torch.amp.autocast('cuda',dtype=torch.bfloat16):
                     loss=model(input_ids=ids,attention_mask=mask,labels=lab).loss/cfg.gradient_accumulation_steps
-            else:loss=model(input_ids=ids,attention_mask=mask,labels=lab).loss/cfg.gradient_accumulation_steps
-            scaler.scale(loss).backward()
+            else:
+                loss=model(input_ids=ids,attention_mask=mask,labels=lab).loss/cfg.gradient_accumulation_steps
+            loss.backward()
             if(bi+1)%cfg.gradient_accumulation_steps==0:
-                scaler.unscale_(opt);torch.nn.utils.clip_grad_norm_(model.parameters(),cfg.max_grad_norm)
-                scaler.step(opt);scaler.update();sched.step();opt.zero_grad()
+                torch.nn.utils.clip_grad_norm_(model.parameters(),cfg.max_grad_norm)
+                opt.step();sched.step();opt.zero_grad()
             eloss+=loss.item()*cfg.gradient_accumulation_steps;nb+=1
             if(bi+1)%200==0:print(f"  E{ep+1}|B{bi+1}/{spe}|L:{eloss/nb:.4f}|T:{(time.time()-t0)/60:.1f}m")
         print(f"Epoch {ep+1}|L:{eloss/nb:.4f}|{(time.time()-ep0)/60:.1f}m|Tot:{(time.time()-t0)/60:.1f}m")

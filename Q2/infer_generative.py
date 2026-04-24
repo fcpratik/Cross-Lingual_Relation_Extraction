@@ -1,11 +1,16 @@
-"""Task 2: Inference — outputs Q2_<lang>.jsonl"""
+"""Task 2: Inference — FIXED
+- Model loaded from odir (same dir where train.sh saved it)
+- Output: odir/Q2_{lang}.jsonl
+"""
 import os,sys,json,time,torch
 from transformers import AutoTokenizer,AutoModelForCausalLM
 from peft import PeftModel
 
 def read_jsonl(fp):
     data=[]
-    if not os.path.exists(fp):return data
+    if not os.path.exists(fp):
+        print(f"WARNING: File not found: {fp}")
+        return data
     with open(fp,'r',encoding='utf-8') as f:
         for line in f:
             line=line.strip()
@@ -14,7 +19,8 @@ def read_jsonl(fp):
                 except:pass
     if data:return data
     with open(fp,'r',encoding='utf-8') as f:content=f.read().strip()
-    buf,bc=""  ,0
+    if not content:return data
+    buf,bc="",0
     for line in content.split("\n"):
         s=line.strip()
         if not s:continue
@@ -51,19 +57,23 @@ def closest_label(gen,valid):
 def infer(lang,test_file,odir):
     t0=time.time();dev=torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device:{dev}|Lang:{lang}")
-    model_dir=os.path.join(os.path.dirname(os.path.abspath(__file__)),"output")
-    cfg=json.load(open(os.path.join(model_dir,"config.json")))
-    vlabels=json.load(open(os.path.join(model_dir,"valid_labels.json"),encoding="utf-8"))
-    e2i={};p=os.path.join(model_dir,"en_to_indic.json")
+
+    # odir is BOTH where model lives AND where output goes
+    cfg=json.load(open(os.path.join(odir,"config.json")))
+    vlabels=json.load(open(os.path.join(odir,"valid_labels.json"),encoding="utf-8"))
+    e2i={};p=os.path.join(odir,"en_to_indic.json")
     if os.path.exists(p):e2i=json.load(open(p,encoding="utf-8"))
     lmap=e2i.get(lang,{})
-    tok=AutoTokenizer.from_pretrained(os.path.join(model_dir,"tokenizer"))
+
+    tok=AutoTokenizer.from_pretrained(os.path.join(odir,"tokenizer"))
     if tok.pad_token is None:tok.pad_token=tok.eos_token
     tok.padding_side="left"
+
     dt=torch.bfloat16 if dev.type=="cuda" and torch.cuda.is_bf16_supported() else torch.float32
     base=AutoModelForCausalLM.from_pretrained(cfg["model_name"],torch_dtype=dt)
-    model=PeftModel.from_pretrained(base,os.path.join(model_dir,"lora_adapter")).to(dev).eval()
+    model=PeftModel.from_pretrained(base,os.path.join(odir,"lora_adapter")).to(dev).eval()
     print(f"Loaded in {(time.time()-t0)/60:.1f}m")
+
     data=read_jsonl(test_file);print(f"Samples:{len(data)}")
     items=[]
     for ei,e in enumerate(data):
@@ -71,6 +81,7 @@ def infer(lang,test_file,odir):
         for ri,rm in enumerate(e.get("relationMentions",[])):
             items.append((ei,ri,fmt_in(s,rm.get("em1Text",""),rm.get("em2Text",""))))
     print(f"Predictions:{len(items)}")
+
     BS=16;preds={};amp=dev.type=="cuda"
     amp_dt=torch.bfloat16 if(amp and torch.cuda.is_bf16_supported())else torch.float16
     for bs in range(0,len(items),BS):
@@ -90,8 +101,8 @@ def infer(lang,test_file,odir):
             el=closest_label(gen,vlabels+["NA"])
             preds[(it[0],it[1])]=lmap.get(el,el) if lang!="en" and lmap else el
         if((bs//BS)+1)%10==0:print(f"  {bs+len(batch)}/{len(items)}|{(time.time()-t0)/60:.1f}m")
-    os.makedirs(odir,exist_ok=True)
-    # TA-required output name: Q2_<lang>.jsonl
+
+    # Output: Q2_{lang}.jsonl in odir
     of=os.path.join(odir,f"Q2_{lang}.jsonl")
     with open(of,"w",encoding="utf-8") as f:
         for ei,e in enumerate(data):

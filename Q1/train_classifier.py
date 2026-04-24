@@ -15,7 +15,7 @@ class Config:
     num_epochs=3;max_seq_len=150
     warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
     max_en_samples=25000
-    max_train_minutes=120
+    max_train_minutes=140
     seed=42
     num_pool_layers=4
     rare_oversample=2
@@ -193,6 +193,7 @@ def train(cfg,odir,root):
     lora=LoraConfig(task_type=TaskType.FEATURE_EXTRACTION,r=cfg.lora_r,lora_alpha=cfg.lora_alpha,
                      lora_dropout=cfg.lora_dropout,target_modules=cfg.lora_target_modules,bias="none")
     peft_model=get_peft_model(base,lora)
+    peft_model.enable_input_require_grads()
     peft_model.gradient_checkpointing_enable()
     peft_model.print_trainable_parameters()
     model=REModel(peft_model,peft_model.config.hidden_size,nl,cfg.num_pool_layers,cfg.lora_dropout).to(dev)

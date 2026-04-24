@@ -1,7 +1,13 @@
-
+"""
+Task 3: ICL for Cross-Lingual RE
+- Primary: meta-llama/Meta-Llama-3.1-8B-Instruct (HF id) or TA-provided local path
+- Fallback: Qwen/Qwen2.5-7B-Instruct
+- TF-IDF retrieval for demo selection
+"""
 import os,sys,json,time,numpy as np
 from collections import defaultdict
 
+# TA-provided local model path (Update 2)
 LLAMA_LOCAL_PATH = "/home/scai/msr/aiy247541/scratch/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
 
 def read_jsonl(fp):
