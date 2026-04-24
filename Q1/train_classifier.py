@@ -12,7 +12,7 @@ class Config:
     lora_target_modules=["q_proj","v_proj","k_proj","o_proj","gate_proj","up_proj","down_proj"]
     batch_size=64;gradient_accumulation_steps=1
     learning_rate_lora=2e-4;learning_rate_head=1e-3
-    num_epochs=5;max_seq_len=200
+    num_epochs=10;max_seq_len=200
     warmup_ratio=0.06;weight_decay=0.01;max_grad_norm=1.0
     max_en_samples=60000
     max_train_minutes=135
