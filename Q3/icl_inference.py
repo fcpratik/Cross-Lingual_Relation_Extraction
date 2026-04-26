@@ -294,8 +294,7 @@ def infer(lang,test_file,odir):
         preds[(it[0],it[1])]=lmap.get(el,el) if lang!="en" and lmap else el
 
     os.makedirs(odir,exist_ok=True)
-    # TA-required output name: Q3_<lang>.jsonl
-    of=os.path.join(odir,f"Q3_{lang}.jsonl")
+    of=os.path.join(odir,f"output_{lang}.jsonl")
     with open(of,"w",encoding="utf-8") as f:
         for ei,e in enumerate(data):
             out={"articleId":e.get("articleId",""),"sentId":e.get("sentId",""),
