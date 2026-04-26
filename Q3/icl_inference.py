@@ -9,6 +9,10 @@ from collections import defaultdict
 
 # TA-provided local model path (Update 2)
 LLAMA_LOCAL_PATH = "/home/scai/msr/aiy247541/scratch/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659"
+MAX_MODEL_LEN = 4096
+MAX_NEW_TOKENS = 30
+PROMPT_MARGIN = 64
+MAX_PROMPT_TOKENS = MAX_MODEL_LEN - MAX_NEW_TOKENS - PROMPT_MARGIN
 
 def read_jsonl(fp):
     data=[]
@@ -120,6 +124,59 @@ def build_prompt(sent,e1,e2,demos,vlabels):
     query=f"\nSentence: {sent}\nEntity 1: {e1}\nEntity 2: {e2}\nRelation:"
     return sys_msg+"\n"+demo_txt+query
 
+def get_tokenizer(model_candidates):
+    try:
+        from transformers import AutoTokenizer
+    except Exception:
+        return None
+    for mname in model_candidates:
+        try:
+            tok=AutoTokenizer.from_pretrained(mname)
+            if tok.pad_token is None:tok.pad_token=tok.eos_token
+            tok.padding_side="left"
+            return tok
+        except Exception:
+            continue
+    return None
+
+def prompt_len(tok,text):
+    if tok is None:
+        # Conservative byte-level fallback for Indic scripts.
+        return len(text.encode("utf-8"))
+    return len(tok(text,add_special_tokens=False)["input_ids"])
+
+def trim_text_by_tokens(tok,text,max_tokens):
+    if max_tokens<=0:return ""
+    if tok is None:
+        return text.encode("utf-8")[:max_tokens].decode("utf-8","ignore")
+    ids=tok(text,add_special_tokens=False)["input_ids"]
+    if len(ids)<=max_tokens:return text
+    keep=max_tokens//2
+    tail=max_tokens-keep
+    return tok.decode(ids[:keep],skip_special_tokens=True)+" ... "+tok.decode(ids[-tail:],skip_special_tokens=True)
+
+def build_bounded_prompt(sent,e1,e2,demos,vlabels,tok,max_tokens=MAX_PROMPT_TOKENS):
+    for ndemos in range(len(demos),-1,-1):
+        prompt=build_prompt(sent,e1,e2,demos[:ndemos],vlabels)
+        if prompt_len(tok,prompt)<=max_tokens:
+            return prompt
+
+    # If the query itself is unusually long, keep the label list and entities,
+    # but shorten the sentence so vLLM never rejects the request.
+    base=build_prompt("",e1,e2,[],vlabels)
+    budget=max_tokens-prompt_len(tok,base)-16
+    short_sent=trim_text_by_tokens(tok,sent,budget)
+    return build_prompt(short_sent,e1,e2,[],vlabels)
+
+def cleanup_cuda():
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():torch.cuda.empty_cache()
+    except Exception:
+        pass
+
 def get_model_candidates():
     """Return list of model paths/names to try in order."""
     candidates = []
@@ -156,31 +213,37 @@ def infer(lang,test_file,odir):
             items.append((ei,ri,s,rm.get("em1Text",""),rm.get("em2Text","")))
     print(f"Predictions: {len(items)}")
 
+    model_candidates = get_model_candidates()
+    tok_for_budget = get_tokenizer(model_candidates)
     NUM_DEMOS=6
     prompts=[]
     for it in items:
         _,_,sent,e1,e2=it
         sel=retriever.retrieve(sent,e1,e2,k=NUM_DEMOS) if retriever else[]
-        prompts.append(build_prompt(sent,e1,e2,sel,vlabels))
+        prompts.append(build_bounded_prompt(sent,e1,e2,sel,vlabels,tok_for_budget))
 
     generated = None
-    model_candidates = get_model_candidates()
 
     # Try vLLM first
     try:
         from vllm import LLM,SamplingParams
         print("Using vLLM backend...")
+        llm=None
         for mname in model_candidates:
             try:
                 print(f"  Trying {mname}")
-                llm=LLM(model=mname,max_model_len=4096,gpu_memory_utilization=0.9)
-                sp=SamplingParams(temperature=0.0,max_tokens=30,stop=["\n"])
+                llm=LLM(model=mname,max_model_len=MAX_MODEL_LEN,gpu_memory_utilization=0.9)
+                sp=SamplingParams(temperature=0.0,max_tokens=MAX_NEW_TOKENS,stop=["\n"])
                 outputs=llm.generate(prompts,sp)
                 generated=[o.outputs[0].text.strip() for o in outputs]
                 print(f"  vLLM OK with {mname}")
                 break
             except Exception as ex:
                 print(f"  vLLM+{mname} failed: {str(ex)[:150]}")
+                if llm is not None:
+                    del llm
+                    llm=None
+                cleanup_cuda()
                 continue
     except ImportError:
         print("vLLM not available.")
@@ -215,10 +278,10 @@ def infer(lang,test_file,odir):
             BS=2
             for bs in range(0,len(prompts),BS):
                 batch=prompts[bs:bs+BS]
-                enc=tok(batch,return_tensors="pt",padding=True,truncation=True,max_length=3500)
+                enc=tok(batch,return_tensors="pt",padding=True,truncation=True,max_length=MAX_PROMPT_TOKENS)
                 ids=enc["input_ids"].to(dev);mask=enc["attention_mask"].to(dev);ilen=ids.shape[1]
                 with torch.no_grad():
-                    out=model.generate(input_ids=ids,attention_mask=mask,max_new_tokens=30,
+                    out=model.generate(input_ids=ids,attention_mask=mask,max_new_tokens=MAX_NEW_TOKENS,
                                         do_sample=False,pad_token_id=tok.pad_token_id)
                 for i in range(len(batch)):
                     gen=tok.decode(out[i][ilen:],skip_special_tokens=True).strip().split("\n")[0]
